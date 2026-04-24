@@ -1,0 +1,156 @@
+#!/bin/sh
+
+command_exists() {
+  command -v "${1}" > /dev/null 2>& 1
+}
+
+assert_command_exists() {
+  for TEST_CMD_NAME; do command_exists "${TEST_CMD_NAME}" && return; done
+  echo "${1}: command not found: install it using your package manager" >& 2
+  exit 1
+}
+
+download() {
+  if command_exists curl; then
+    curl -Lo "${2:-"-"}" "${1}"
+  elif command_exists wget; then
+    wget -O "${2:-"-"}" "${1}"
+  fi
+}
+
+download_required() {
+  mkdir -p "$(dirname "${2}")" && download "${1}" "${2}" || exit
+}
+
+readprop() {
+  sed -n '/^ *'"${2}"' *= *[^ ]/{s/^[^=]*= *"*//;s/"* *$//;p;q0};$q1' "${1}" 2> /dev/null || echo "${3}"
+}
+
+refresh_usercache() {
+  [ -f "usercache.json" ] &&
+  jq -c '([now|gmtime|((.[0]+100)/100|floor)*100,0,1,0,0,0,0,0,0]|strftime("%Y-%m-%d %H:%M:%S %z")) as $expiresOn
+    | map(.expiresOn=$expiresOn)' usercache.json > usercache.json~ &&
+  mv -f usercache.json~ usercache.json
+}
+
+main() {
+  assert_command_exists java
+  assert_command_exists jq
+  assert_command_exists curl wget
+
+  SERVER_LAUNCHER_PROPERTIES=${SERVER_LAUNCHER_PROPERTIES:-"server-launcher.properties"}
+
+  # Check whether Git integration is enabled. If it is, ensure that the repository is initialized and
+  # that the latest history has been pulled from the remote, if one is configured.
+  # This must be done before reading any properties from the config, as they may have been changed remotely.
+  SERVER_LAUNCHER_GIT_BRANCH=$(git branch --show-current --no-color 2> /dev/null)
+  SERVER_LAUNCHER_GIT_REMOTE=$(git rev-parse --abbrev-ref "${SERVER_LAUNCHER_GIT_BRANCH}@{upstream}" 2> /dev/null)
+  SERVER_LAUNCHER_GIT_KEEP=${SERVER_LAUNCHER_GIT_KEEP:-"$(readprop "${SERVER_LAUNCHER_PROPERTIES}" git.keep 1)"}
+  SERVER_LAUNCHER_GIT_LIMIT=${SERVER_LAUNCHER_GIT_LIMIT:-"$(readprop "${SERVER_LAUNCHER_PROPERTIES}" git.limit 0)"}
+  SERVER_LAUNCHER_GIT_ENABLE=${SERVER_LAUNCHER_GIT_ENABLE:-"$(readprop "${SERVER_LAUNCHER_PROPERTIES}" git.enable ${SERVER_LAUNCHER_GIT_BRANCH:+true})"}
+  if [ "${SERVER_LAUNCHER_GIT_ENABLE}" = "true" ]; then
+    assert_command_exists git
+    grep -q =lfs .gitattributes 2> /dev/null && assert_command_exists git-lfs
+
+    if [ -z "${SERVER_LAUNCHER_GIT_BRANCH}" ]; then
+      git init && SERVER_LAUNCHER_GIT_BRANCH=$(git branch --show-current --no-color 2> /dev/null) || return
+    fi
+    if [ -n "${SERVER_LAUNCHER_GIT_REMOTE}" ]; then
+      git pull --force || return
+    fi
+  fi
+
+  # Read the server properties from the config.
+  MINECRAFT_VERSION=${MINECRAFT_VERSION:-"$(readprop "${SERVER_LAUNCHER_PROPERTIES}" minecraft.version)"}
+  FABRIC_LOADER_VERSION=${FABRIC_LOADER_VERSION:-"$(readprop "${SERVER_LAUNCHER_PROPERTIES}" fabric-loader.version)"}
+  FABRIC_INSTALLER_VERSION=${FABRIC_INSTALLER_VERSION:-"$(readprop "${SERVER_LAUNCHER_PROPERTIES}" fabric-installer.version 1.1.1)"}
+
+  # Restore the modpack if one is specified.
+  PACKWIZ_URL=${PACKWIZ_URL:-"$(readprop "${SERVER_LAUNCHER_PROPERTIES}" packwiz.url)"}
+  if [ -n "${PACKWIZ_URL}" ]; then
+    PACKWIZ_HOME=${PACKWIZ_HOME:-"$(readprop "${SERVER_LAUNCHER_PROPERTIES}" packwiz.root .packwiz)"}
+    PACKWIZ_CACHE=${PACKWIZ_CACHE:-"${PACKWIZ_HOME}/cache.json"}
+    PACKWIZ_BOOTSTRAP_VERSION=${PACKWIZ_BOOTSTRAP_VERSION:-"$(readprop "${SERVER_LAUNCHER_PROPERTIES}" packwiz.bootstrap.version)"}
+    PACKWIZ_BOOTSTRAP_URL=${PACKWIZ_BOOTSTRAP_URL:-"$(readprop "${SERVER_LAUNCHER_PROPERTIES}" packwiz.bootstrap.url "https://github.com/packwiz/packwiz-installer-bootstrap/releases/download/v${PACKWIZ_BOOTSTRAP_VERSION:-"0.0.3"}/packwiz-installer-bootstrap.jar")"}
+    PACKWIZ_BOOTSTRAP_VERSION=${PACKWIZ_BOOTSTRAP_VERSION:-"$(echo "${PACKWIZ_BOOTSTRAP_URL}" | jq -Rr '[scan("\\d+\\.\\d+(?:\\.\\d+)*")][0] // ""')"}
+    PACKWIZ_BOOTSTRAP_JAR=${PACKWIZ_BOOTSTRAP_JAR:-"${PACKWIZ_HOME}/bootstrap/${PACKWIZ_BOOTSTRAP_VERSION}/packwiz-installer-bootstrap.jar"}
+    PACKWIZ_INSTALLER_JAR=${PACKWIZ_INSTALLER_JAR:-"${PACKWIZ_HOME}/packwiz-installer.jar"}
+    [ -f "${PACKWIZ_BOOTSTRAP_JAR}" ] || download_required "${PACKWIZ_BOOTSTRAP_URL}" "${PACKWIZ_BOOTSTRAP_JAR}"
+    java -jar "${PACKWIZ_BOOTSTRAP_JAR}" -g -s server "${PACKWIZ_URL}" --bootstrap-main-jar "${PACKWIZ_INSTALLER_JAR}" --meta-file "${PACKWIZ_CACHE}" || return
+
+    if [ -z "${MINECRAFT_VERSION}" -o -z "${FABRIC_LOADER_VERSION}" ]; then
+      download_required "${PACKWIZ_URL}" "${PACKWIZ_HOME}/pack.toml"
+      MINECRAFT_VERSION=${MINECRAFT_VERSION:-"$(readprop "${PACKWIZ_HOME}/pack.toml" minecraft)"}
+      FABRIC_LOADER_VERSION=${FABRIC_LOADER_VERSION:-"$(readprop "${PACKWIZ_HOME}/pack.toml" fabric)"}
+    fi
+  fi
+
+  # Prepare the server jar.
+  FABRIC_HOME=${FABRIC_HOME:-"$(readprop "${SERVER_LAUNCHER_PROPERTIES}" fabric-loader.root .fabric)"}
+  FABRIC_LOADER_VERSION=${FABRIC_LOADER_VERSION:-"0.19.0"}
+  FABRIC_INSTALLER_URL=${FABRIC_INSTALLER_URL:-"$(readprop "${SERVER_LAUNCHER_PROPERTIES}" fabric-installer.url)"}
+  FABRIC_INSTALLER_URL=${FABRIC_INSTALLER_URL:-"https://meta.fabricmc.net/v2/versions/loader/${MINECRAFT_VERSION:?"minecraft.version is unset"}/${FABRIC_LOADER_VERSION}/${FABRIC_INSTALLER_VERSION}/server/jar"}
+  MINECRAFT_VERSION=${MINECRAFT_VERSION:-"$(echo "${FABRIC_INSTALLER_URL}" | jq -Rr '[scan("\\d+\\.\\d+(?:\\.\\d+)*")][0] // ""')"}
+  FABRIC_LOADER_VERSION=${FABRIC_LOADER_VERSION:-"$(echo "${FABRIC_INSTALLER_URL}" | jq -Rr '[scan("\\d+\\.\\d+(?:\\.\\d+)*")][1] // ""')"}
+  FABRIC_INSTALLER_VERSION=${FABRIC_INSTALLER_VERSION:-"$(echo "${FABRIC_INSTALLER_URL}" | jq -Rr '[scan("\\d+\\.\\d+(?:\\.\\d+)*")][2] // ""')"}
+  FABRIC_SERVER_JAR="${FABRIC_HOME}/versions/${MINECRAFT_VERSION}/${FABRIC_LOADER_VERSION}/${FABRIC_INSTALLER_VERSION}/fabric-server.jar"
+  MINECRAFT_SERVER_JAR="${FABRIC_HOME}/versions/${MINECRAFT_VERSION}/${FABRIC_LOADER_VERSION}/${FABRIC_INSTALLER_VERSION}/minecraft-server.jar"
+  [ -f "${FABRIC_SERVER_JAR}" ] || download_required "${FABRIC_INSTALLER_URL}" "${FABRIC_SERVER_JAR}"
+
+  # Refresh the user cache before starting the server to avoid unwanted evictions.
+  SERVER_LAUNCHER_KEEP_USERCACHE=${SERVER_LAUNCHER_KEEP_USERCACHE:-"$(readprop "${SERVER_LAUNCHER_PROPERTIES}" usercache.keep)"}
+  [ "${SERVER_LAUNCHER_KEEP_USERCACHE}" = "true" ] && refresh_usercache
+
+  # Accept the EULA and run the server.
+  SERVER_LAUNCHER_JAVA_ARGS=${SERVER_LAUNCHER_JAVA_ARGS:-"$(readprop "${SERVER_LAUNCHER_PROPERTIES}" java.args)"}
+  echo "eula=true" > eula.txt &&
+  java "-Dfabric.installer.server.gameJar=${MINECRAFT_SERVER_JAR}" ${SERVER_LAUNCHER_JAVA_ARGS} -jar "${FABRIC_SERVER_JAR}" nogui "$@"
+
+  # Refresh the user cache once more, because the server automatically sets expiry dates for recently connected
+  # players to one month into the future, even if the previous expiry date was set to a later date.
+  [ "${SERVER_LAUNCHER_KEEP_USERCACHE}" = "true" ] && refresh_usercache
+
+  # Remove comments from the server.properties file, as the server automatically updates them each time
+  # it runs to reflect the current date and time, resulting in unnecessary Git history pollution.
+  [ -f "server.properties" ] &&
+  sed '/\s*#/d' server.properties > server.properties~ &&
+  mv -f server.properties~ server.properties
+
+  # Normalize all non-user-provided json files by sorting all keys in all objects alphabetically and
+  # sorting entries in top-level arrays by the "uuid" field, which is relevant for files such as:
+  # usercache.json, ops.json, etc.
+  find . \
+    -type f -name '*.json' \
+    -not -path './.*' \
+    -not -path '*/*config*/*' \
+    -execdir sh -c 'jq -S "sort_by(.uuid)? // ." "$1" > "$1~"; mv -f "$1~" "$1"' sh '{}' ';'
+
+  # If Git integration is enabled, commit all changes and push them to the remote, if one is configured.
+  if [ "${SERVER_LAUNCHER_GIT_ENABLE}" = "true" ]; then
+    git add -A &&
+    git commit -m "Update #$(date +"%Y-%m-%d_%H%M%S")" || return
+
+    # If the number of commits exceeds the user-specified limit, compact the history into a single commit and run the GC.
+    if [ "$SERVER_LAUNCHER_GIT_LIMIT" -gt 0 ] && [ "$(git log --oneline --max-count="$(($SERVER_LAUNCHER_GIT_LIMIT + 1))" | wc -l)" -gt "$SERVER_LAUNCHER_GIT_LIMIT" ]; then
+      _git_i=$(($SERVER_LAUNCHER_GIT_KEEP > 0 ? ($SERVER_LAUNCHER_GIT_KEEP - 1) : 0))
+      git switch --orphan="__${SERVER_LAUNCHER_GIT_BRANCH}_compacted" &&
+      git clean -fdx &&
+      git restore -s "${SERVER_LAUNCHER_GIT_BRANCH}~${_git_i}" . &&
+      git add -A &&
+      git commit -C "${SERVER_LAUNCHER_GIT_BRANCH}~${_git_i}" &&
+      { [ "$_git_i" = 0 ] || git cherry-pick "${SERVER_LAUNCHER_GIT_BRANCH}~${_git_i}..${SERVER_LAUNCHER_GIT_BRANCH}" ; } &&
+      git branch -M "${SERVER_LAUNCHER_GIT_BRANCH}" || return
+      if [ -n "${SERVER_LAUNCHER_GIT_REMOTE}" ]; then
+        git branch --set-upstream-to="${SERVER_LAUNCHER_GIT_REMOTE}" &&
+        git push --force || return
+      fi
+      git reflog expire --expire=now --all && git gc --prune=now
+    elif [ -n "${SERVER_LAUNCHER_GIT_REMOTE}" ]; then
+      git push --force || return
+    fi
+  fi
+
+  return 0
+}
+
+main "$@"
