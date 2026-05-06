@@ -12,7 +12,7 @@ assert_command_exists() {
 
 download() {
   if command_exists curl; then
-    curl -Lo "${2:-"-"}" "${1}"
+    curl -fsSLo "${2:-"-"}" "${1}"
   elif command_exists wget; then
     wget -O "${2:-"-"}" "${1}"
   fi
@@ -26,6 +26,33 @@ readprop() {
   sed -n '/^ *'"${2}"' *= *[^ ]/{s/^[^=]*= *"*//;s/"* *$//;p;q0};$q1' "${1}" 2> /dev/null || echo "${3}"
 }
 
+get_os() {
+  case "$(uname -s)" in
+    Linux) case "$(readprop /etc/os-release ID)" in alpine) printf alpine- ;; esac; printf linux ;;
+    Darwin) printf mac ;;
+    FreeBSD) printf freebsd ;;
+    OpenBSD) printf openbsd ;;
+    AIX) printf aix ;;
+    SunOS) printf solaris ;;
+    CYGWIN*|MINGW*|MSYS*) printf windows ;;
+    *) printf unknown ;;
+  esac
+}
+
+get_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64) printf x64 ;;
+    i386|i686) printf x32 ;;
+    aarch64|armv8|arm64) printf aarch64 ;;
+    arm*) printf arm ;;
+    ppc64) printf ppc64 ;;
+    ppc64le) printf ppc64le ;;
+    riscv64) printf riscv64 ;;
+    s390x) printf s390x ;;
+    *) printf unknown ;;
+  esac
+}
+
 refresh_usercache() {
   [ -f "usercache.json" ] &&
   jq -c '([now|gmtime|((.[0]+100)/100|floor)*100,0,1,0,0,0,0,0,0]|strftime("%Y-%m-%d %H:%M:%S %z")) as $expiresOn
@@ -34,7 +61,6 @@ refresh_usercache() {
 }
 
 main() {
-  assert_command_exists java
   assert_command_exists jq
   assert_command_exists curl wget
 
@@ -61,11 +87,13 @@ main() {
   fi
 
   # Read the server properties from the config.
+  SERVER_LAUNCHER_JAVA_ARGS=${SERVER_LAUNCHER_JAVA_ARGS:-"$(readprop "${SERVER_LAUNCHER_PROPERTIES}" java.args)"}
+  JRE_VERSION=${JRE_VERSION:-"$(readprop "${SERVER_LAUNCHER_PROPERTIES}" java.version)"}
   MINECRAFT_VERSION=${MINECRAFT_VERSION:-"$(readprop "${SERVER_LAUNCHER_PROPERTIES}" minecraft.version)"}
   FABRIC_LOADER_VERSION=${FABRIC_LOADER_VERSION:-"$(readprop "${SERVER_LAUNCHER_PROPERTIES}" fabric-loader.version)"}
   FABRIC_INSTALLER_VERSION=${FABRIC_INSTALLER_VERSION:-"$(readprop "${SERVER_LAUNCHER_PROPERTIES}" fabric-installer.version 1.1.1)"}
 
-  # Restore the modpack if one is specified.
+  # Prepare the packwiz jar.
   PACKWIZ_URL=${PACKWIZ_URL:-"$(readprop "${SERVER_LAUNCHER_PROPERTIES}" packwiz.url)"}
   if [ -n "${PACKWIZ_URL}" ]; then
     PACKWIZ_HOME=${PACKWIZ_HOME:-"$(readprop "${SERVER_LAUNCHER_PROPERTIES}" packwiz.root .packwiz)"}
@@ -76,10 +104,10 @@ main() {
     PACKWIZ_BOOTSTRAP_JAR=${PACKWIZ_BOOTSTRAP_JAR:-"${PACKWIZ_HOME}/bootstrap/${PACKWIZ_BOOTSTRAP_VERSION}/packwiz-installer-bootstrap.jar"}
     PACKWIZ_INSTALLER_JAR=${PACKWIZ_INSTALLER_JAR:-"${PACKWIZ_HOME}/packwiz-installer.jar"}
     [ -f "${PACKWIZ_BOOTSTRAP_JAR}" ] || download_required "${PACKWIZ_BOOTSTRAP_URL}" "${PACKWIZ_BOOTSTRAP_JAR}"
-    java -jar "${PACKWIZ_BOOTSTRAP_JAR}" -g -s server "${PACKWIZ_URL}" --bootstrap-main-jar "${PACKWIZ_INSTALLER_JAR}" --meta-file "${PACKWIZ_CACHE}" || return
 
-    if [ -z "${MINECRAFT_VERSION}" -o -z "${FABRIC_LOADER_VERSION}" ]; then
+    if [ -z "${JRE_VERSION}" ] || [ -z "${MINECRAFT_VERSION}" ] || [ -z "${FABRIC_LOADER_VERSION}" ]; then
       download_required "${PACKWIZ_URL}" "${PACKWIZ_HOME}/pack.toml"
+      JRE_VERSION=${JRE_VERSION:-"$(readprop "${PACKWIZ_HOME}/pack.toml" java)"}
       MINECRAFT_VERSION=${MINECRAFT_VERSION:-"$(readprop "${PACKWIZ_HOME}/pack.toml" minecraft)"}
       FABRIC_LOADER_VERSION=${FABRIC_LOADER_VERSION:-"$(readprop "${PACKWIZ_HOME}/pack.toml" fabric)"}
     fi
@@ -97,14 +125,29 @@ main() {
   MINECRAFT_SERVER_JAR="${FABRIC_HOME}/versions/${MINECRAFT_VERSION}/${FABRIC_LOADER_VERSION}/${FABRIC_INSTALLER_VERSION}/minecraft-server.jar"
   [ -f "${FABRIC_SERVER_JAR}" ] || download_required "${FABRIC_INSTALLER_URL}" "${FABRIC_SERVER_JAR}"
 
+  # Prepare the java executable.
+  JAVA_EXEC=${JAVA_EXEC:-"$(readprop "${SERVER_LAUNCHER_PROPERTIES}" java.path)"}
+  JRE_URL=${JRE_URL:-"$(readprop "${SERVER_LAUNCHER_PROPERTIES}" java.url)"}
+  JRE_URL=${JRE_URL:-"${JRE_VERSION:+"https://api.adoptium.net/v3/binary/latest/${JRE_VERSION}/ga/$(get_os)/$(get_arch)/jre/hotspot/normal/eclipse"}"}
+  if [ -z "${JAVA_EXEC}" ] && [ -n "${JRE_URL}" ]; then
+    JRE_HOME=${JRE_HOME:-"$(readprop "${SERVER_LAUNCHER_PROPERTIES}" java.root .java)"}
+    JRE_VERSION=${JRE_VERSION:-"$(echo "${JRE_URL}" | jq -Rr '[scan("\\d+(?:\\.\\d+)*")][1] // ""')"}
+    JRE_DIR=${JRE_DIR:-"${JRE_HOME}/jre${JRE_VERSION}"}
+    JAVA_EXEC="${JRE_DIR}/bin/java" && [ ! -x "${JAVA_EXEC}" ] && JAVA_EXEC="${JRE_DIR}/Contents/Home/bin/java"
+    [ ! -x "${JAVA_EXEC}" ] && download_required "${JRE_URL}" "${JRE_DIR}.tar.gz" && mkdir -m 755 -p "${JRE_DIR}" &&
+    tar -xf "${JRE_DIR}.tar.gz" -C "${JRE_DIR}" --strip-components=1 && rm -f "${JRE_DIR}.tar.gz" &&
+    [ ! -x "${JAVA_EXEC}" ] && JAVA_EXEC="${JRE_DIR}/bin/java"
+  fi
+  assert_command_exists "${JAVA_EXEC:="java"}"
+
   # Refresh the user cache before starting the server to avoid unwanted evictions.
   SERVER_LAUNCHER_KEEP_USERCACHE=${SERVER_LAUNCHER_KEEP_USERCACHE:-"$(readprop "${SERVER_LAUNCHER_PROPERTIES}" usercache.keep)"}
   [ "${SERVER_LAUNCHER_KEEP_USERCACHE}" = "true" ] && refresh_usercache
 
-  # Accept the EULA and run the server.
-  SERVER_LAUNCHER_JAVA_ARGS=${SERVER_LAUNCHER_JAVA_ARGS:-"$(readprop "${SERVER_LAUNCHER_PROPERTIES}" java.args)"}
-  echo "eula=true" > eula.txt &&
-  java "-Dfabric.installer.server.gameJar=${MINECRAFT_SERVER_JAR}" ${SERVER_LAUNCHER_JAVA_ARGS} -jar "${FABRIC_SERVER_JAR}" nogui "$@"
+  # Accept the EULA, restore the modpack and run the server.
+  echo "eula=true" > eula.txt || return
+  [ -z "${PACKWIZ_URL}" ] || "${JAVA_EXEC}" -jar "${PACKWIZ_BOOTSTRAP_JAR}" -g -s server "${PACKWIZ_URL}" --bootstrap-main-jar "${PACKWIZ_INSTALLER_JAR}" --meta-file "${PACKWIZ_CACHE}" || return
+  "${JAVA_EXEC}" "-Dfabric.installer.server.gameJar=${MINECRAFT_SERVER_JAR}" ${SERVER_LAUNCHER_JAVA_ARGS} -jar "${FABRIC_SERVER_JAR}" nogui "$@"
 
   # Refresh the user cache once more, because the server automatically sets expiry dates for recently connected
   # players to one month into the future, even if the previous expiry date was set to a later date.
