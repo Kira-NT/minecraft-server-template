@@ -12,6 +12,7 @@
 /shaderpacks
 /versions
 
+/allowed_symlinks.txt
 /debug-profile.json
 /eula.txt
 /options.txt

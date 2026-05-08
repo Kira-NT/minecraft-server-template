@@ -144,8 +144,9 @@ main() {
   SERVER_LAUNCHER_KEEP_USERCACHE=${SERVER_LAUNCHER_KEEP_USERCACHE:-"$(readprop "${SERVER_LAUNCHER_PROPERTIES}" usercache.keep)"}
   [ "${SERVER_LAUNCHER_KEEP_USERCACHE}" = "true" ] && refresh_usercache
 
-  # Accept the EULA, restore the modpack and run the server.
+  # Accept the EULA, allow symlinks, restore the modpack and run the server.
   echo "eula=true" > eula.txt || return
+  echo "[regex].*" > allowed_symlinks.txt || return
   [ -z "${PACKWIZ_URL}" ] || "${JAVA_EXEC}" -jar "${PACKWIZ_BOOTSTRAP_JAR}" -g -s server "${PACKWIZ_URL}" --bootstrap-main-jar "${PACKWIZ_INSTALLER_JAR}" --meta-file "${PACKWIZ_CACHE}" || return
   "${JAVA_EXEC}" "-Dfabric.installer.server.gameJar=${MINECRAFT_SERVER_JAR}" ${SERVER_LAUNCHER_JAVA_ARGS} -jar "${FABRIC_SERVER_JAR}" nogui "$@"
 
